@@ -1,0 +1,150 @@
+from google.colab import files
+uploaded = files.upload()
+
+# ====== 匯入套件 ======
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+
+# ====== 1. 載入資料 ======
+df = pd.read_csv("regression_dataset.csv")
+X = df[['longitude', 'latitude']].values.astype(np.float32)
+y = df['value'].values.astype(np.float32).reshape(-1, 1)
+
+# 儲存經緯度供畫圖用
+lon = df['longitude'].values
+lat = df['latitude'].values
+
+# ====== 2. 資料切分 ======
+X_trainval, X_test, y_trainval, y_test, lon_trainval, lon_test, lat_trainval, lat_test = train_test_split(
+    X, y, lon, lat, test_size=0.2, random_state=42)
+
+X_train, X_val, y_train, y_val, lon_train, lon_val, lat_train, lat_val = train_test_split(
+    X_trainval, y_trainval, lon_trainval, lat_trainval, test_size=0.25, random_state=42)
+
+# ====== 3. 轉成 tensor ======
+X_train_tensor = torch.tensor(X_train)
+y_train_tensor = torch.tensor(y_train)
+X_val_tensor = torch.tensor(X_val)
+y_val_tensor = torch.tensor(y_val)
+X_test_tensor = torch.tensor(X_test)
+y_test_tensor = torch.tensor(y_test)
+
+# ====== 4. 建立模型======
+class RegressionModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(2, 20),
+            nn.Tanh(),
+            nn.Linear(20, 13),
+            nn.ReLU(),
+            nn.Linear(13, 1)
+        )
+    def forward(self, x):
+        return self.model(x)
+
+model = RegressionModel()
+loss_fn = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.1)
+
+# ====== 5. 訓練模型（Early Stopping）======
+EPOCHS = 200
+PATIENCE = 30
+MIN_DELTA = 1e-5
+train_losses, val_losses = [], []
+best_val_loss = float('inf')
+best_model_state = None
+wait = 0
+
+for epoch in range(EPOCHS):
+    model.train()
+    y_pred = model(X_train_tensor)
+    loss = loss_fn(y_pred, y_train_tensor)
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    train_losses.append(loss.item())
+
+    model.eval()
+    with torch.no_grad():
+        y_val_pred = model(X_val_tensor)
+        val_loss = loss_fn(y_val_pred, y_val_tensor).item()
+        val_losses.append(val_loss)
+
+    if (epoch + 1) % 5 == 0:
+        print(f"Epoch {epoch+1}/{EPOCHS} - Train Loss: {loss.item():.6f} - Val Loss: {val_loss:.6f}")
+
+    if val_loss < best_val_loss - MIN_DELTA:
+        best_val_loss = val_loss
+        best_model_state = model.state_dict()
+        wait = 0
+    else:
+        wait += 1
+        if wait >= PATIENCE:
+            print(f"\n⏹️ Early stopping triggered at epoch {epoch+1}. Best Val Loss = {best_val_loss:.6f}")
+            break
+
+if best_model_state:
+    model.load_state_dict(best_model_state)
+
+# ====== 6. 評估模型 ======
+model.eval()
+with torch.no_grad():
+    y_test_pred = model(X_test_tensor)
+    test_mse = loss_fn(y_test_pred, y_test_tensor).item()
+
+# ====== 7. 畫 Loss 曲線 ======
+plt.figure(figsize=(8, 4))
+plt.plot(train_losses, label="Train Loss")
+plt.plot(val_losses, label="Validation Loss")
+plt.title("Training & Validation MSE Loss")
+plt.xlabel("Epoch")
+plt.ylabel("MSE Loss")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# ====== 8. 預測 vs 真實值圖 ======
+plt.figure(figsize=(6, 6))
+plt.scatter(y_test, y_test_pred, alpha=0.4)
+plt.plot([y.min(), y.max()], [y.min(), y.max()], 'r--')
+plt.xlabel("True Temperature")
+plt.ylabel("Predicted Temperature")
+plt.title("True vs Predicted Temperature")
+plt.grid(True)
+plt.show()
+
+# ====== 9. 溫度地圖 & 誤差地圖 ======
+X_all_tensor = torch.tensor(X)
+with torch.no_grad():
+    y_all_pred = model(X_all_tensor).numpy()
+
+errors = y_all_pred.flatten() - y.flatten()
+
+# 預測溫度地圖
+plt.figure(figsize=(8, 6))
+sc1 = plt.scatter(lon, lat, c=y_all_pred.flatten(), cmap='coolwarm', s=20)
+plt.colorbar(sc1, label="Predicted Temperature")
+plt.title("Predicted Temperature Map")
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.grid(True)
+plt.show()
+
+# 預測誤差地圖
+plt.figure(figsize=(8, 6))
+sc2 = plt.scatter(lon, lat, c=errors, cmap='bwr', s=20)
+plt.colorbar(sc2, label="Prediction Error (Pred - True)")
+plt.title("Prediction Error Map")
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.grid(True)
+plt.show()
+
+# ====== 10. 印出結果 ======
+print(f"\n✅ 測試集 MSE Loss：{test_mse:.6f}")
+print(f"✅ 使用 Early Stopping，最佳驗證 MSE Loss 為：{best_val_loss:.6f}")
