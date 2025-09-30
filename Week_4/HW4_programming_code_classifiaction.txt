@@ -1,0 +1,132 @@
+from google.colab import files
+uploaded = files.upload()
+
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+
+# ====== 載入資料 ======
+df = pd.read_csv("classification_dataset.csv")
+X = df[['longitude', 'latitude']].values.astype(np.float32)
+y = df['label'].values.astype(np.float32)
+
+# ====== 切分資料集 (Train:Val:Test = 70:20:10) ======
+X_trainval, X_test, y_trainval, y_test = train_test_split(
+    X, y, test_size=0.1, random_state=42, stratify=y
+)
+X_train, X_val, y_train, y_val = train_test_split(
+    X_trainval, y_trainval, test_size=2/9, random_state=42, stratify=y_trainval
+)
+
+# ====== 轉成 PyTorch tensors ======
+X_train_tensor = torch.tensor(X_train)
+y_train_tensor = torch.tensor(y_train).unsqueeze(1)
+X_val_tensor   = torch.tensor(X_val)
+y_val_tensor   = torch.tensor(y_val).unsqueeze(1)
+X_test_tensor  = torch.tensor(X_test)
+y_test_tensor  = torch.tensor(y_test).unsqueeze(1)
+
+# ====== 模型定義 ======
+class Classifier(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(2, 12),
+            nn.ReLU(),
+            nn.Linear(12, 10),
+            nn.ReLU(),
+            nn.Linear(10, 1),
+            nn.Sigmoid()
+        )
+    def forward(self, x):
+        return self.model(x)
+
+model = Classifier()
+loss_fn = nn.BCELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+
+# ====== 訓練模型（含 Early Stopping）======
+EPOCHS = 200
+PATIENCE = 20
+MIN_DELTA = 1e-6
+
+train_losses, val_losses, val_accuracies = [], [], []
+best_val_loss = float('inf')
+best_params = None
+wait = 0
+stopped_epoch = None
+
+for epoch in range(EPOCHS):
+    model.train()
+    y_pred = model(X_train_tensor)
+    train_loss = loss_fn(y_pred, y_train_tensor)
+    optimizer.zero_grad()
+    train_loss.backward()
+    optimizer.step()
+
+    model.eval()
+    with torch.no_grad():
+        y_val_pred = model(X_val_tensor)
+        val_loss = loss_fn(y_val_pred, y_val_tensor).item()
+        y_val_pred_class = (y_val_pred > 0.5).float()
+        val_acc = (y_val_pred_class.flatten() == y_val).float().mean().item()
+
+    train_losses.append(train_loss.item())
+    val_losses.append(val_loss)
+    val_accuracies.append(val_acc)
+
+    print(f"Epoch {epoch+1:3d}/{EPOCHS} - Train Loss: {train_loss.item():.6f} - Val Loss: {val_loss:.6f} - Val Acc: {val_acc:.4f}")
+
+    if val_loss < best_val_loss - MIN_DELTA:
+        best_val_loss = val_loss
+        best_params = model.state_dict()
+        wait = 0
+    else:
+        wait += 1
+        if wait >= PATIENCE:
+            stopped_epoch = epoch + 1
+            print(f"\n⏹ Early Stopping triggered at epoch {stopped_epoch}.")
+            break
+
+# 還原最佳參數
+if best_params is not None:
+    model.load_state_dict(best_params)
+
+# ====== 測試模型 ======
+model.eval()
+with torch.no_grad():
+    y_test_pred = model(X_test_tensor)
+    test_loss = loss_fn(y_test_pred, y_test_tensor).item()
+    y_test_pred_class = (y_test_pred > 0.5).float()
+    test_acc = (y_test_pred_class.flatten() == y_test).float().mean().item()
+
+# ====== 視覺化 ======
+plt.figure(figsize=(6, 4))
+plt.plot(train_losses, label="Train Loss")
+plt.plot(val_losses, label="Validation Loss")
+plt.title("Training & Validation Loss")
+plt.xlabel("Epoch")
+plt.ylabel("Binary Cross Entropy Loss")
+plt.legend()
+plt.grid(True)
+plt.show()
+
+plt.figure(figsize=(6, 4))
+plt.plot(val_accuracies, label="Validation Accuracy", color='green')
+plt.title("Validation Accuracy Curve")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.grid(True)
+plt.legend()
+plt.show()
+
+# ====== 最終結果輸出 ======
+print(f"✅ 測試集準確率：{test_acc*100:.2f}%")
+print(f"📉 測試集 Binary Cross Entropy Loss：{test_loss:.6f}")
+if stopped_epoch:
+    print(f"🛑 最佳模型出現在 Epoch {stopped_epoch - wait}，驗證損失為 {best_val_loss:.6f}")
+else:
+    print(f"✅ 未觸發 Early Stopping，最佳驗證損失為 {best_val_loss:.6f}")
