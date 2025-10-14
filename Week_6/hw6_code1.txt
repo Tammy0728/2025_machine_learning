@@ -1,0 +1,173 @@
+# ============================================================
+# QDA (Quadratic Discriminant Analysis) from scratch
+# ▶ 無 validation set：僅使用 Train + Test (80/20)
+# ▶ 上傳 CSV 檔、不用路徑
+# ▶ μ0：紅星、μ1：藍星；黑邊、文字同色
+# ============================================================
+
+import io, time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from matplotlib.lines import Line2D
+
+# -------------------------------
+# 1) 上傳 CSV（Colab / Jupyter / 本機）
+# -------------------------------
+def load_csv_via_upload():
+    try:
+        from google.colab import files  # Colab
+        print("偵測到 Google Colab：請上傳 CSV 檔...")
+        uploaded = files.upload()
+        fname = list(uploaded.keys())[0]
+        print(f"已上傳：{fname}")
+        return pd.read_csv(io.BytesIO(uploaded[fname]))
+    except Exception:
+        pass
+
+    try:
+        from ipywidgets import FileUpload  # Jupyter
+        from IPython.display import display
+        print("偵測到 Jupyter：請在下方小工具上傳 CSV 檔...")
+        uploader = FileUpload(accept='.csv', multiple=False)
+        display(uploader)
+        while not uploader.value:
+            time.sleep(0.2)
+        item = list(uploader.value.values())[0]
+        content = item['content']
+        fname = item['metadata'].get('name', 'uploaded.csv')
+        print(f"已上傳：{fname}")
+        return pd.read_csv(io.BytesIO(content))
+    except Exception:
+        pass
+
+    try:
+        import tkinter as tk  # 本機
+        from tkinter import filedialog
+        root = tk.Tk(); root.withdraw()
+        print("請選擇你的 CSV 檔案...")
+        path = filedialog.askopenfilename(
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+        )
+        print(f"已選擇：{path}")
+        return pd.read_csv(path)
+    except Exception as e:
+        raise RuntimeError("無法開啟上傳/選檔流程。") from e
+
+df = load_csv_via_upload()
+
+# -------------------------------
+# 2) 自動偵測欄位
+# -------------------------------
+label_col = None
+for c in df.columns:
+    if c.lower() in ["label", "target", "y"]:
+        label_col = c
+        break
+if label_col is None:
+    label_col = df.columns[-1]
+
+X = df.iloc[:, :2].values
+y = df[label_col].values
+
+print(f"\n偵測到標籤欄位：{label_col}")
+print(f"使用的特徵欄位：{df.columns[:2].tolist()}\n")
+
+# -------------------------------
+# 3) 分成 Train (80%) + Test (20%)
+# -------------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# -------------------------------
+# 4) 手刻 QDA 模型
+# -------------------------------
+class QDAFromScratch:
+    def __init__(self, reg=1e-6):
+        self.reg = reg
+
+    def fit(self, X, y):
+        self.classes_ = np.unique(y)
+        n, d = X.shape
+        self.mu_, self.pi_, self.Sigma_, self.Sigma_inv_ = {}, {}, {}, {}
+        for c in self.classes_:
+            Xc = X[y == c]
+            self.mu_[c] = Xc.mean(axis=0)
+            self.pi_[c] = len(Xc) / n
+            diff = Xc - self.mu_[c]
+            Sigma_k = (diff.T @ diff) / len(Xc)
+            Sigma_k += self.reg * np.eye(d)
+            self.Sigma_[c] = Sigma_k
+            self.Sigma_inv_[c] = np.linalg.inv(Sigma_k)
+
+    def scores(self, X):
+        S = np.zeros((X.shape[0], len(self.classes_)))
+        for j, c in enumerate(self.classes_):
+            mu, Sigma, Sinv, pi = self.mu_[c], self.Sigma_[c], self.Sigma_inv_[c], self.pi_[c]
+            quad = np.sum((X - mu) @ Sinv * (X - mu), axis=1)
+            S[:, j] = -0.5 * np.log(np.linalg.det(Sigma)) - 0.5 * quad + np.log(pi)
+        return S
+
+    def predict(self, X):
+        S = self.scores(X)
+        return self.classes_[np.argmax(S, axis=1)]
+
+qda = QDAFromScratch()
+qda.fit(X_train, y_train)
+
+# -------------------------------
+# 5) 準確率
+# -------------------------------
+def accuracy(y_true, y_pred): return np.mean(y_true == y_pred)
+test_acc = accuracy(y_test, qda.predict(X_test))
+print(f"Test Accuracy = {test_acc:.4f}")
+
+# -------------------------------
+# 6) 繪圖：分類背景 + 邊界 + 原始資料 + μ0/μ1
+# -------------------------------
+x_min, x_max = X[:, 0].min() - 0.05, X[:, 0].max() + 0.05
+y_min, y_max = X[:, 1].min() - 0.05, X[:, 1].max() + 0.05
+xx, yy = np.meshgrid(np.linspace(x_min, x_max, 600),
+                     np.linspace(y_min, y_max, 600))
+grid = np.c_[xx.ravel(), yy.ravel()]
+S = qda.scores(grid)
+Z = qda.predict(grid).reshape(xx.shape)
+
+plt.figure(figsize=(7, 6))
+plt.contourf(xx, yy, Z, alpha=0.25, cmap="coolwarm")
+
+# 黑色決策邊界
+handles = []
+if len(qda.classes_) >= 2:
+    c0, c1 = qda.classes_[0], qda.classes_[1]
+    diff = (S[:, 1] - S[:, 0]).reshape(xx.shape)
+    plt.contour(xx, yy, diff, levels=[0.0], linewidths=2.5, colors='k')
+    handles.append(Line2D([0], [0], color='k', lw=2.5, label="Decision boundary"))
+
+# 原始資料點
+scatter_handles = []
+for c in np.unique(y):
+    sc = plt.scatter(X[y == c, 0], X[y == c, 1], s=36, edgecolor='k', label=f"label {c}")
+    scatter_handles.append(sc)
+
+# μ0、μ1：紅藍星形
+mean_handles = []
+if len(qda.classes_) >= 1:
+    mu0 = qda.mu_[qda.classes_[0]]
+    h0 = plt.scatter(mu0[0], mu0[1], marker='*', s=220, c='red', edgecolor='k', linewidths=1.8, label=r"$\mu_0$")
+    plt.annotate(r"$\mu_0$", (mu0[0], mu0[1]), textcoords="offset points", xytext=(8, 6), color='red', fontsize=11)
+    mean_handles.append(h0)
+if len(qda.classes_) >= 2:
+    mu1 = qda.mu_[qda.classes_[1]]
+    h1 = plt.scatter(mu1[0], mu1[1], marker='*', s=220, c='blue', edgecolor='k', linewidths=1.8, label=r"$\mu_1$")
+    plt.annotate(r"$\mu_1$", (mu1[0], mu1[1]), textcoords="offset points", xytext=(8, 6), color='blue', fontsize=11)
+    mean_handles.append(h1)
+
+plt.xlabel(df.columns[0])
+plt.ylabel(df.columns[1])
+plt.title(f"QDA Decision Boundary (Test Acc = {test_acc:.3f})")
+plt.legend(handles=scatter_handles + mean_handles + handles, loc="lower right")
+plt.tight_layout()
+plt.show()

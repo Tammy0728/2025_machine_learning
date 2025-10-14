@@ -1,0 +1,262 @@
+import io, time, os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+
+# -------------------------------
+# 0) Helpers: robust CSV loader (file path -> or upload / file dialog)
+# -------------------------------
+def load_csv_smart(default_path=None, prompt="請上傳/選擇 CSV 檔..."):
+    # 1) If a default path exists, use it first
+    if default_path and os.path.exists(default_path):
+        print(f"從路徑讀取：{default_path}")
+        return pd.read_csv(default_path)
+
+    # 2) Google Colab upload
+    try:
+        from google.colab import files  # type: ignore
+        print("偵測到 Google Colab：", prompt)
+        uploaded = files.upload()
+        if not uploaded:
+            raise RuntimeError("未上傳任何檔案。")
+        fname = list(uploaded.keys())[0]
+        print(f"已上傳：{fname}")
+        return pd.read_csv(io.BytesIO(uploaded[fname]))
+    except Exception:
+        pass
+
+    # 3) Jupyter widgets
+    try:
+        from ipywidgets import FileUpload
+        from IPython.display import display
+        print("偵測到 Jupyter：", prompt)
+        uploader = FileUpload(accept='.csv', multiple=False)
+        display(uploader)
+        while not uploader.value:
+            time.sleep(0.2)
+        item = list(uploader.value.values())[0]
+        content = item['content']  # bytes
+        fname = item['metadata'].get('name', 'uploaded.csv')
+        print(f"已上傳：{fname}")
+        return pd.read_csv(io.BytesIO(content))
+    except Exception:
+        pass
+
+    # 4) Local file dialog
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk(); root.withdraw()
+        print(prompt)
+        path = filedialog.askopenfilename(
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+        )
+        if not path:
+            raise RuntimeError("未選擇任何檔案。")
+        print(f"已選擇：{path}")
+        return pd.read_csv(path)
+    except Exception as e:
+        raise RuntimeError("無法開啟上傳/選檔流程。請確認執行環境。") from e
+
+# -------------------------------
+# 1) Load two datasets
+# -------------------------------
+df_cls = load_csv_smart("/mnt/data/classification_dataset.csv", "請上傳『classification_dataset.csv』")
+df_reg = load_csv_smart("/mnt/data/regression_dataset.csv", "請上傳『regression_dataset.csv』")
+
+# Detect columns
+def detect_label_col(df, candidates=("label","target","y")):
+    for c in df.columns:
+        if c.lower() in candidates:
+            return c
+    return df.columns[-1]
+
+def detect_reg_col(df, candidates=("value","target","y")):
+    for c in df.columns:
+        if c.lower() in candidates:
+            return c
+    return df.columns[-1]
+
+# Features: 前兩欄
+Xc = df_cls.iloc[:, :2].values
+yc = df_cls[detect_label_col(df_cls)].values
+
+Xr = df_reg.iloc[:, :2].values
+yr = df_reg[detect_reg_col(df_reg)].values.astype(float)
+
+print("\n[資料偵測]")
+print("分類特徵欄位：", df_cls.columns[:2].tolist(), "  分類標籤欄：", detect_label_col(df_cls))
+print("回歸特徵欄位：", df_reg.columns[:2].tolist(), "  回歸目標欄：", detect_reg_col(df_reg))
+
+# -------------------------------
+# 2) Split sets (80/20)
+# -------------------------------
+Xc_tr, Xc_te, yc_tr, yc_te = train_test_split(
+    Xc, yc, test_size=0.2, stratify=yc, random_state=42
+)
+Xr_tr, Xr_te, yr_tr, yr_te = train_test_split(
+    Xr, yr, test_size=0.2, random_state=42
+)
+
+print(f"\n[切分]")
+print(f"分類：train={len(yc_tr)}, test={len(yc_te)}")
+print(f"回歸：train={len(yr_tr)}, test={len(yr_te)}")
+
+# -------------------------------
+# 3) Classifier C: QDA (from scratch)
+# -------------------------------
+class QDAFromScratch:
+    def __init__(self, reg=1e-6):
+        self.reg = reg
+    def fit(self, X, y):
+        self.classes_ = np.unique(y)
+        n, d = X.shape
+        self.mu_, self.pi_, self.Sigma_, self.Sigma_inv_ = {}, {}, {}, {}
+        for c in self.classes_:
+            Xc = X[y == c]
+            self.mu_[c] = Xc.mean(axis=0)
+            self.pi_[c] = len(Xc) / n
+            diff = Xc - self.mu_[c]
+            S = (diff.T @ diff) / len(Xc)
+            S += self.reg * np.eye(d)
+            self.Sigma_[c] = S
+            self.Sigma_inv_[c] = np.linalg.inv(S)
+    def scores(self, X):
+        S = np.zeros((X.shape[0], len(self.classes_)))
+        for j, c in enumerate(self.classes_):
+            mu, Sig, Sinv, pi = self.mu_[c], self.Sigma_[c], self.Sigma_inv_[c], self.pi_[c]
+            quad = np.sum((X - mu) @ Sinv * (X - mu), axis=1)
+            S[:, j] = -0.5*np.log(np.linalg.det(Sig)) - 0.5*quad + np.log(pi)
+        return S
+    def predict(self, X):
+        S = self.scores(X)
+        return self.classes_[np.argmax(S, axis=1)]
+
+# -------------------------------
+# 4) Regressor R: Linear Regression (normal equation)
+# -------------------------------
+class LinearRegressionClosedForm:
+    def __init__(self, ridge=0.0):
+        self.ridge = ridge
+    def fit(self, X, y):
+        n = X.shape[0]
+        Xb = np.c_[np.ones((n,1)), X]          # add intercept
+        A = Xb.T @ Xb
+        if self.ridge > 0:
+            L = np.eye(A.shape[0]); L[0,0] = 0
+            A = A + self.ridge * L
+        self.theta_ = np.linalg.pinv(A) @ Xb.T @ y
+    def predict(self, X):
+        Xb = np.c_[np.ones((X.shape[0],1)), X]
+        return Xb @ self.theta_
+
+# -------------------------------
+# 5) Train C and R
+# -------------------------------
+C = QDAFromScratch(reg=1e-6)
+C.fit(Xc_tr, yc_tr)
+
+R = LinearRegressionClosedForm(ridge=0.0)
+R.fit(Xr_tr, yr_tr)
+
+# -------------------------------
+# 6) Evaluate
+# -------------------------------
+def accuracy(y_true, y_pred): return float(np.mean(y_true == y_pred))
+def mae(y_true, y_pred): return float(np.mean(np.abs(y_true - y_pred)))
+def rmse(y_true, y_pred): return float(np.sqrt(np.mean((y_true - y_pred)**2)))
+def r2(y_true, y_pred):
+    ss_res = np.sum((y_true - y_pred)**2)
+    ss_tot = np.sum((y_true - np.mean(y_true))**2)
+    return float(1 - ss_res/ss_tot) if ss_tot > 0 else float('nan')
+
+# (a) Classification metric
+yc_hat_te = C.predict(Xc_te)
+cls_acc = accuracy(yc_te, yc_hat_te)
+
+# (b) Piecewise on regression test set
+c_on_reg = C.predict(Xr_te)         # 0/1
+r_pred    = R.predict(Xr_te)        # continuous
+h_pred    = np.where(c_on_reg == 1, r_pred, -999.0)
+
+mask_eval = (c_on_reg == 1)
+num_eval  = int(np.sum(mask_eval))
+reg_metrics = {}
+if num_eval > 0:
+    reg_metrics = {
+        "MAE":  mae(yr_te[mask_eval], r_pred[mask_eval]),
+        "RMSE": rmse(yr_te[mask_eval], r_pred[mask_eval]),
+        "R2":   r2(yr_te[mask_eval], r_pred[mask_eval]),
+    }
+else:
+    reg_metrics = {"MAE": None, "RMSE": None, "R2": None}
+
+print("\n[評估結果]")
+print(f"Classification Test Accuracy (on classification_dataset) : {cls_acc:.4f}")
+print(f"在 regression 測試集中，C(x)=1 的樣本數：{num_eval} / {len(yr_te)}")
+print("Regression metrics on those C(x)=1 samples:", reg_metrics)
+
+# -------------------------------
+# 7) Visualizations
+#   (1) Histogram of h(x) (with -999 spike)
+#   (2) Histogram of R(x) for C(x)=1 only (zoomed 1–99 percentile)
+#   (3) True vs Pred (only where C(x)=1)
+#   (4) Optional: decision boundary for classification set
+# -------------------------------
+# (1) 全體 h(x)
+plt.figure(figsize=(6,4))
+plt.hist(h_pred, bins=60)
+plt.title("Histogram of h(x) on regression test set (includes -999)")
+plt.xlabel("h(x)"); plt.ylabel("count")
+plt.tight_layout()
+plt.show()
+
+# (2) 只看連續分佈（C(x)=1）
+if num_eval > 0:
+    cont_vals = h_pred[mask_eval]      # 這就是 R(x) 的輸出
+    p1, p99 = np.percentile(cont_vals, [1, 99])  # 自動抓範圍讓分佈更清楚
+    print(f"[連續分佈範圍參考] 1% ~ 99% 百分位: [{p1:.3f}, {p99:.3f}]")
+    plt.figure(figsize=(6,4))
+    plt.hist(cont_vals, bins=60)
+    plt.xlim(p1, p99)                  # 聚焦於主要分佈
+    plt.title("Histogram of R(x) where C(x)=1 (zoomed to 1–99 percentile)")
+    plt.xlabel("R(x)"); plt.ylabel("count")
+    plt.tight_layout()
+    plt.show()
+
+    # (3) True vs Pred（只在 C(x)=1）
+    plt.figure(figsize=(5,5))
+    plt.scatter(yr_te[mask_eval], r_pred[mask_eval], s=18)
+    lo = min(np.min(yr_te[mask_eval]), np.min(r_pred[mask_eval]))
+    hi = max(np.max(yr_te[mask_eval]), np.max(r_pred[mask_eval]))
+    plt.plot([lo,hi],[lo,hi])
+    plt.title("True vs Pred (only where C(x)=1)")
+    plt.xlabel("True"); plt.ylabel("Pred")
+    plt.tight_layout()
+    plt.show()
+
+# (4) Optional decision boundary on classification set
+PLOT_DECISION_BOUNDARY = False
+if PLOT_DECISION_BOUNDARY and Xc.shape[1] == 2:
+    xx_min, xx_max = Xc[:,0].min() - 0.05, Xc[:,0].max() + 0.05
+    yy_min, yy_max = Xc[:,1].min() - 0.05, Xc[:,1].max() + 0.05
+    xx, yy = np.meshgrid(np.linspace(xx_min, xx_max, 400),
+                         np.linspace(yy_min, yy_max, 400))
+    grid = np.c_[xx.ravel(), yy.ravel()]
+    Z = C.predict(grid).reshape(xx.shape)
+    plt.figure(figsize=(6,5))
+    plt.contourf(xx, yy, Z, alpha=0.25)
+    for c in np.unique(yc):
+        plt.scatter(Xc[yc==c,0], Xc[yc==c,1], s=12, label=f"label {c}")
+    plt.legend()
+    plt.title("Classifier decision regions (classification_dataset)")
+    plt.tight_layout()
+    plt.show()
+
+# -------------------------------
+# 8) Sanity checks printed
+# -------------------------------
+print("\n[Piecewise 行為檢查]")
+print(f"h(x) 中等於 -999 的個數：{int(np.sum(h_pred == -999))}")
+print(f"h(x) 中不等於 -999 的個數：{int(np.sum(h_pred != -999))}（這些點是由 R(x) 給的）")
